@@ -1,0 +1,352 @@
+you got it — here’s the whole system, piece by piece. i’ll start with “what happens when,” then break down every component, data format, security control, and the UI endpoints you can use to observe it.
+
+---
+
+# 1) end-to-end flow (what happens when you upload a patient JSON)
+
+1. **You upload a JSON file in the Flask UI.**
+
+   * The UI POSTs to `/upload-run`.
+   * The server normalizes the email field (accepts `patient_email`, `email`, `patientEmail`, `patient-email`) and writes the JSON to **S3** at `raw_data/<patient_id>.json`.
+   * The server then **starts Step Functions** (CareGap state machine) with input: `{"patient": <the json>}`.
+
+2. **S3 ObjectCreated → EventBridge → DataProcessor Lambda.**
+
+   * EventBridge rule forwards the S3 event to `DataProcessorFunction`.
+   * That Lambda reads the file back from S3 (for completeness) and **starts Step Functions** too (so either path works).
+   * It also “nudges” a Bedrock Agent (optional parallel path) — success/failure doesn’t impact the main workflow.
+
+3. **Step Functions runs the care-gap plan:**
+
+   * `PlannerFunction` returns a **plan** and a **runId** (UUID).
+   * `ReportParserFunction` assembles `patient.last_lab_result` if needed (supports CSV or JSON in `report_payload`).
+   * `FhirToolFunction` sets `risk = high/low` (from the parsed result).
+   * `SearchGuidelineToolFunction` returns a short guideline snippet (stub).
+   * `ProposeActionFunction` compiles:
+
+     * `analysis_result` (risk, recommended actions, guideline)
+     * `followup` (department, provider name/role, visit type, urgency, window, notes)
+     * `patient_message` (text for email or patient portal).
+
+4. **Human approval (Discord) is required for high-risk or `requiresApproval`:**
+
+   * `DiscordApprovalFunction` posts a rich embed to your Discord webhook with:
+
+     * Patient, risk, recommended actions, **full follow-up plan** (department, provider, visit, etc.), plan steps, **Approve/Reject** URLs, patient contact, and runId.
+   * State Machine waits (`lambda:invoke.waitForTaskToken`) until:
+
+     * You click Approve/Reject in Discord → API Gateway (GET /approve) → `ApprovalCallbackFunction` → `SendTaskSuccess/Failure`.
+
+5. **After approval (or if approval bypassed), workflow executes and emails patient:**
+
+   * `ExecuteActionFunction` pushes a summary to SQS (demo stub).
+   * `AppointmentMailerFunction`:
+
+     * **Finds `patient_email`** from state input (thanks to the UI normalization).
+     * Sends an email via **SES** (subject: Follow-up Appointment; body depends on risk).
+     * Mirrors an audit message to **Discord** (e.g., “📧 Email sent to Hackathon Demo `<ram…@gmail.com>`”).
+     * Writes a trace row into **RunsTable (DynamoDB)** (e.g., `discord:email` + status).
+
+6. **Memory and summary:**
+
+   * `WriteMemoryFunction` writes/updates the patient’s memory item in **AgentMemoryTable (DynamoDB)** under:
+
+     * `pk = patient#<patient_id>`, `sk = caregap#latest`
+     * `risk` and `actions` (plaintext stringified JSON).
+     * (When KMS is wired in the writer, it can store encrypted “sensitive” duplicates like `patient_email_enc`, `actions_enc` too).
+   * `SummarizeRunFunction` stores a raw summary of the run in **RunsTable** (for later supportability).
+
+---
+
+# 2) the infrastructure (cloudformation)
+
+**Parameters**
+
+* `Environment` (`dev|staging|prod`), `NameSuffix` (like `red`), `BucketNamePrefix`, `AgentName`, `FoundationModelId`, `DiscordWebhookUrl`, `SesFromEmail`, etc.
+
+**Core resources**
+
+* **S3 bucket**: private, public access blocked, lifecycle on `temp/`, SSE (bucket-level KMS via default S3-managed unless you customize).
+* **EventBridge Rule**: listens to S3 Create events → `DataProcessorFunction`.
+* **SQS Queue** (`NotificationQueue`): the tool target for notifications.
+* **DynamoDB tables**:
+
+  * `AgentMemoryTable`: agent memory; **SSE enabled**.
+  * `AgentRunsTable`: run/trace (discord/email logs, summaries); **SSE enabled**.
+* **Lambda roles**: `LambdaExecutionRole` with S3/SQS/SNS/DynamoDB/States/Bedrock/SES/SecretsManager access; `StateMachineExecutionRole` for invoking Lambdas, DynamoDB, SQS; `BedrockAgentRole`.
+* **Lambdas**: planner, parser, FHIR, guideline, propose, execute, appointment mailer, write memory, summarize run, discord approval, approval callback, data generator, data processor, patient gateway.
+* **Step Functions state machine** with explicit JSON definition (no comments).
+* **API Gateway v2 (HTTP)**:
+
+  * `POST /ask` → patient-facing Bedrock Agent (optional)
+  * `GET /approve` → approval callback.
+
+**Outputs**
+
+* Bucket name, Queue URL, Agent IDs, Patient API URL, **Approval base URL**, State Machine ARN, table names, etc.
+
+---
+
+# 3) lambdas — what each one does (and the gotchas we fixed)
+
+* **PlannerFunction**
+
+  * Tries Bedrock to produce a mini JSON plan; if Bedrock isn’t reachable, returns a hard-coded plan.
+  * **Generates `runId`** — critical for Discord run log correlation.
+
+* **ReportParserFunction**
+
+  * Ensures `patient.last_lab_result` is present (parses JSON or CSV fallback).
+  * Adds `is_critical` if HbA1c ≥ 7.0 (or extreme sentinel values).
+
+* **FhirToolFunction**
+
+  * Returns `verified=true`, `risk = high|low`, and structured facts.
+
+* **SearchGuidelineToolFunction**
+
+  * Returns a small natural-language snippet (stubbed “guideline”).
+
+* **ProposeActionFunction**
+
+  * Builds `analysis_result` and a concrete `followup` plan.
+  * Honors `preferred_doctor` / `preferred_department` if provided.
+
+* **DiscordApprovalFunction**
+
+  * Builds and posts an embed (patient, risk, actions, **follow-up details**, steps, approve/reject links, patient email, runId).
+  * Writes *discord:* traces to **RunsTable**.
+
+* **ApprovalCallbackFunction**
+
+  * Accepts both `t` (base64 urlsafe token) and legacy `token`, tries multiple decode strategies to handle URL encoding issues.
+  * Calls `SendTaskSuccess` (approve) or `SendTaskFailure` (reject) back to Step Functions.
+
+* **ExecuteActionFunction**
+
+  * Pushes a combined body to SQS — in a real build you’d integrate an EHR task here.
+
+* **AppointmentMailerFunction**
+
+  * **Logs the entire incoming event** for debug, and **checks/echoes `patient_email`**.
+  * Mirrors success/failure to Discord and traces to **RunsTable** (even when `run_id` is missing it logs a warning).
+  * Key fix: first lines of handler log the entire patient snapshot so if email is missing you can see exactly what reached this Lambda.
+
+* **WriteMemoryFunction**
+
+  * Upserts an item: `pk=patient#…`, `sk=caregap#latest`, `risk`, `actions`.
+  * (When extended with KMS, it can store `patient_email_enc`, `actions_enc`, and `patient_email_sha256` too.)
+
+* **SummarizeRunFunction**
+
+  * Writes a “summary blob” row keyed by `runId`.
+
+* **DataProcessorFunction**
+
+  * Kicks the state machine off on S3 events; also optionally invokes a Bedrock Agent session.
+
+* **PatientGatewayFunction**
+
+  * Minimal patient-facing chat; passes through to Bedrock Agent alias with the patient JSON.
+
+---
+
+# 4) security & encryption
+
+* **S3 encryption**: Bucket has SSE enabled (S3-managed by default). The `/security` panel calls `get_bucket_encryption` and shows algo + KMS key id if configured.
+
+* **DynamoDB SSE**: Both `AgentMemoryTable` and `AgentRunsTable` have SSE turned on. The `/security` endpoint calls `describe_table` and displays `SSEType` and `KMSMasterKeyArn` (when present).
+
+* **Field-level KMS (demo)**:
+
+  * We added KMS helpers in the Flask UI to **decrypt** ciphertext fields that your writer Lambda can store (`patient_email_enc`, `actions_enc`).
+  * The UI shows two views:
+
+    1. **Encrypted fields view (`/memory/encrypted` or `/memory/decrypted`)** — returns ciphertext and a live-decrypted value (using your `KMS_KEY_ARN` and encryption context).
+    2. **KMS “hello world” (`/kms/encrypt-decrypt-demo`)** — quick encrypt/decrypt roundtrip without DDB.
+
+* **Encryption context**: we use a structured context such as
+  `{"table": <MemoryTableName>, "patient_id": <pid>, "topic": <topic>}`
+  so ciphertext is scoped to the patient/topic; this gives you **cryptographic binding** and defense against mis-bound blobs.
+
+* **IAM/KMS permissions**:
+
+  * The **Lambda execution role** that runs the Flask UI (or your writer Lambda) must have **kms:Encrypt/kms:Decrypt** on your CMK.
+  * The **KMS key policy** must include that role ARN (not just a user), or at least allow your account root + IAM policies that reference this role (depending on your KMS policy model).
+  * We also showed a tight in-line key policy snippet earlier (principal = specific role ARN) to stop the `AccessDeniedException` you saw.
+
+---
+
+# 5) the Flask UI — what each page/endpoint shows
+
+Front page UI sections (unchanged `<style>` as you asked):
+
+1. **Upload patient JSON & start**:
+
+   * Takes your JSON file, shows the executionArn and echoes the `patientId` and `Email` it detected.
+   * Normalization ensures downstream Lambdas see `patient_email`.
+
+2. **Live Execution Timeline**:
+
+   * SSE stream (`/events/stream`) + fallback poll (`/history`) from Step Functions.
+   * Shows state transitions.
+
+3. **Detailed Steps**:
+
+   * `/history-detailed` builds a per-state view with **inputs** and **outputs** (pretty JSON), truncation flags, duration, and errors.
+
+4. **Discord Run Log**:
+
+   * `/history-merged` extracts `runId` from the “Plan” output.
+   * `/discord-log` queries **RunsTable** for rows where `step` starts with `discord:` (approval post, email mirror, errors).
+
+5. **Memory (latest)** and **Memory (all)**:
+
+   * Reads from **AgentMemoryTable** all items for `pk=patient#<id>`; latest or all.
+
+6. **RunsTable (raw)**:
+
+   * Dumps all rows for your `runId` (approval, email, summary).
+
+7. **Security**:
+
+   * S3 encryption config and DDB SSE info so you can show the judges actual server-side encryption data.
+
+8. **Memory (encrypted & decrypted views)**:
+
+   * If your writer Lambda saved `patient_email_enc` and `actions_enc`, the UI will **show those ciphertexts** and **decrypt them live** to prove end-to-end KMS.
+   * If those are missing, you’ll see `null` — which simply means the writer didn’t store the encrypted copies (SSE is still active at the table level; this section is about **field-level** encryption).
+
+9. **Utilities**
+
+   * Simple Discord ping to verify webhook connectivity.
+
+---
+
+# 6) data formats you pass around
+
+**Upload JSON (example)**
+
+```json
+{
+  "patient_id": "demo-123",
+  "patient_name": "Hackathon Demo",
+  "patient_email": "ramnalawade1986@gmail.com",
+  "last_lab_result": { "test_name": "HbA1c", "result_value": 12.2, "is_critical": true },
+  "preferred_doctor": "Dr. A. Endo",
+  "preferred_department": "Endocrinology"
+}
+```
+
+**State Machine input (start)**
+
+```json
+{ "patient": { ...your json... } }
+```
+
+**Planner output (simplified)**
+
+```json
+{
+  "plan": { "steps":[...], "requiresApproval": true, "topic": "caregap" },
+  "runId": "uuid..."
+}
+```
+
+**ProposeAction output (simplified)**
+
+```json
+{
+  "analysis_result": {
+    "risk_assessment": "high",
+    "recommended_actions": ["Notify care team","Schedule follow-up"],
+    "guideline_snippet": "Guideline: ..."
+  },
+  "followup": {
+    "department": "Endocrinology",
+    "provider_role": "Endocrinologist (MD)",
+    "provider_name": "On-call Endocrinology",
+    "visit_type": "Clinic visit",
+    "duration_min": 30,
+    "urgency": "High",
+    "window": "within 14 days",
+    "notes": "Discuss medication adjustment and lifestyle counseling."
+  },
+  "patient_message": "Your recent results require a follow-up..."
+}
+```
+
+**AgentMemory item**
+
+```
+pk = patient#<patient_id>
+sk = caregap#latest
+ts = <unix>
+risk = "high"|"low"
+actions = "[...]"               # plaintext string
+# optional encrypted fields (if writer stores them):
+patient_email_sha256 = "<hash>"
+patient_email_enc = {"ciphertext_b64":"...","alg":"KMS"}
+actions_enc = {"ciphertext_b64":"...","alg":"KMS"}
+```
+
+---
+
+# 7) the fixes we implemented (the issues you hit)
+
+* **“Invalid template resource property 'Environment'”**:
+  Cleaned template to only use `Parameters.Environment` in Tags/Names rather than as a property on resources that don’t support it.
+
+* **Discord approval click → “We couldn’t record your decision”**:
+  Added robust token handling in `ApprovalCallbackFunction`: supports both `t` (base64 urlsafe) and legacy `token` with multiple decode attempts (raw, percent-decoded, plus/space fixes).
+
+* **Planner “No runId found”**:
+  Extracts `runId` from multiple places in execution history, including `planOut.runId` and loose `runId` fields, scanning both `TaskSucceeded` and `TaskStateExited`.
+
+* **`patient_email` missing downstream**:
+  UI now **normalizes** email at upload time, and Lambdas also print the patient snapshot at entry; Discord (mailer lambda) mirrors a warning if email is absent.
+
+* **DynamoDB log visibility**:
+  Appointment mailer and approval Lambda write to **RunsTable**; UI has `/runs` and `/discord-log` endpoints to see them.
+
+* **KMS “AccessDeniedException”**:
+  Clarified that the **Lambda role** (not your IAM user) must be granted on the **KMS key policy**, and/or you must use a key with **key policy that trusts your account** + an IAM policy attached to the Lambda role. We provided a minimal key policy snippet earlier that you can paste to grant the role `kms:Encrypt`/`Decrypt`.
+
+* **Step Functions JSON comments error**:
+  Removed any `//` comments; definition is strict JSON.
+
+---
+
+# 8) how to *prove* encryption to judges
+
+* Open **Security** panel: shows S3 SSE and DynamoDB SSE (with KMS key ARN if CMK-backed).
+* Open **Memory (encrypted fields)** panel: shows `patient_email_enc`/`actions_enc` and **live decrypted values** via KMS.
+* If those fields are null:
+
+  1. Enable field-level encryption in the **writer** (e.g., WriteMemory Lambda): before writing, call KMS to encrypt and store the wrappers we already designed (`{"ciphertext_b64": ... , "alg":"KMS"}`).
+  2. Ensure your **KMS key policy** lets the **writer Lambda role** encrypt/decrypt.
+  3. Set `KMS_KEY_ARN` environment variable for the decrypting component (Flask UI if it’s performing live decrypt).
+
+You’ll still have table-level SSE regardless, but the encrypted-field demo is the snappy visual “wow.”
+
+---
+
+# 9) operational tips & troubleshooting
+
+* **Email not sending** → Check SES identity is verified and region matches. The mailer Lambda logs both the patient snapshot and any SES errors; Discord mirror will show failures.
+* **Discord not posting** → Check `DISCORD_WEBHOOK_URL` or the secret; `/discord/simple-ping` route verifies connectivity.
+* **Approval callback 400/500** → Inspect CloudWatch logs for `ApprovalCallbackFunction`; the Lambda now logs token decode attempts and Step Functions API errors.
+* **No memory items** → Confirm `WriteMemoryFunction` ran; see “Detailed Steps” and “RunsTable” for its output.
+* **KMS decrypt failing** → Ensure encryption context matches exactly (table, patient_id, topic). Any mismatch will fail decryption by design.
+
+---
+
+# 10) how to demo (3-minute)
+
+1. Upload patient JSON (with `patient_email`), show timeline.
+2. Click “Detailed Steps” → show risk, follow-up.
+3. Approve in Discord → see success page.
+4. Back in UI → “RunsTable (raw)” and “Discord Run Log” show email sent.
+5. “Memory (encrypted fields)” shows ciphertext and live-decrypted values.
+6. “Security” shows S3/DDB/KMS encryption posture.
+

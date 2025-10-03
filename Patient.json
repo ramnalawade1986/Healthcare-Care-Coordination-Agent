@@ -1,0 +1,51 @@
+{
+  "patient_id": "1145860",
+  "patient_name": "Hackathon Demo",
+  "patient_email": "ramnalawade1986@gmail.com",
+
+  "tests": [
+    {
+      "test_code": "HBA1C",
+      "test_name": "HbA1c (NGSP)",
+      "result_value": 12.2,
+      "unit": "%",
+      "reference_range": "4.0 - 5.6",
+      "flag": "HIGH",
+      "is_critical": true,
+      "comment": "Consistent with poorly controlled diabetes."
+    },
+    {
+      "test_code": "FPG",
+      "test_name": "Fasting Plasma Glucose",
+      "result_value": 265,
+      "unit": "mg/dL",
+      "reference_range": "70 - 99",
+      "flag": "CRITICALLY HIGH",
+      "is_critical": true,
+      "comment": "Marked hyperglycemia."
+    },
+    {
+      "test_code": "LIPID_LDL",
+      "test_name": "LDL Cholesterol",
+      "result_value": 160,
+      "unit": "mg/dL",
+      "reference_range": "< 100",
+      "flag": "HIGH",
+      "is_critical": false
+    },
+    {
+      "test_code": "URINE_ALB",
+      "test_name": "Urine Microalbumin",
+      "result_value": 85,
+      "unit": "mg/g creatinine",
+      "reference_range": "< 30",
+      "flag": "HIGH",
+      "is_critical": false,
+      "comment": "Microalbuminuria — early nephropathy possible."
+    }
+  ],
+
+  "last_lab_result": { "test_name": "HbA1c", "result_value": 12.2, "is_critical": true },
+  "preferred_doctor": "Dr. A. Endo",
+  "preferred_department": "Endocrinology"
+}

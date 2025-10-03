@@ -1,0 +1,1929 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Healthcare Care Coordination Agent v2 — autonomous, tool-using, stateful (BLUE variant with unique names).'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  BucketNamePrefix:
+    Type: String
+    Default: healthcare-patient-data-next-new
+    Description: Prefix for the S3 bucket name.
+  NameSuffix:
+    Type: String
+    Default: red
+    Description: Suffix appended to all resource names to avoid conflicts (e.g., blue, v3, canary).
+  FoundationModelId:
+    Type: String
+    Default: anthropic.claude-3-sonnet-20240229-v1:0
+    Description: Bedrock foundation model ID used by planner (update to any available).
+  AgentName:
+    Type: String
+    Default: healthcare-care-coordinator-red
+  DiscordWebhookSecretName:
+    Type: String
+    Default: healthcare-discord-webhook
+    Description: Secrets Manager secret name that stores the Discord webhook URL as plain text (SecretString).
+  SesFromEmail:
+    Type: String
+    Default: noreply@citycare.health
+    Description: Verified SES sender (must be verified before send succeeds).
+  DiscordWebhookUrl:
+    Type: String
+    Default: "https://discord.com/api/webhooks/1421500900643704834/tecGf27CFO6U4hJa0TbroqEzNP3AK2h_ArkNG7WEnVBd9AUk4ojK7Twpv78iMrHuxMCh"
+    Description: (Optional) Direct Discord webhook URL. If empty, the Lambda will use the secret.
+
+Resources:
+  # -----------------------------
+  # KMS (used by S3/DDB/SQS)
+  # -----------------------------
+  DataKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRoot
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+  DataKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/healthcare-data-${Environment}-${NameSuffix}"
+      TargetKeyId: !Ref DataKmsKey
+
+  # -----------------------------
+  # Storage & Messaging
+  # -----------------------------
+  PatientDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketNamePrefix}-${Environment}-${AWS::AccountId}-${NameSuffix}'
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref DataKmsKey
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupTempFiles
+            Status: Enabled
+            ExpirationInDays: 1
+            Prefix: temp/
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HealthcareAgentBlue
+
+  NotificationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'healthcare-notifications-dlq-${Environment}-${NameSuffix}'
+      KmsMasterKeyId: !Ref DataKmsKey
+
+  NotificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'healthcare-notifications-${Environment}-${NameSuffix}'
+      VisibilityTimeout: 300
+      KmsMasterKeyId: !Ref DataKmsKey
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt NotificationDLQ.Arn
+        maxReceiveCount: 5
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # (Keeping SNS but not used for approval anymore; safe to remove if unneeded.)
+  ApprovalTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'healthcare-approval-${Environment}-${NameSuffix}'
+
+  # -----------------------------
+  # Memory / Audit
+  # -----------------------------
+  AgentMemoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'healthcare-agent-memory-${Environment}-${NameSuffix}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKmsKey
+
+  AgentRunsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'healthcare-agent-runs-${Environment}-${NameSuffix}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: runId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: runId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKmsKey
+
+  # -----------------------------
+  # Secrets / Email
+  # -----------------------------
+  DiscordWebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Ref DiscordWebhookSecretName
+      Description: Discord webhook URL for approval notifications.
+      SecretString: 'https://discord.com/api/webhooks/1421500900643704834/tecGf27CFO6U4hJa0TbroqEzNP3AK2h_ArkNG7WEnVBd9AUk4ojK7Twpv78iMrHuxMCh'
+
+  SesIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref SesFromEmail
+
+  # -----------------------------
+  # IAM
+  # -----------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'lambda-exec-healthcare-${Environment}-${NameSuffix}-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub 'HealthcareAgentPermissions-${Environment}-${NameSuffix}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${Environment}-${AWS::AccountId}-${NameSuffix}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${Environment}-${AWS::AccountId}-${NameSuffix}/*'
+              # SQS (tool queue)
+              - Effect: Allow
+                Action: [sqs:SendMessage]
+                Resource: !GetAtt NotificationQueue.Arn
+              # SNS (legacy optional)
+              - Effect: Allow
+                Action: [sns:Publish]
+                Resource: !Ref ApprovalTopic
+              # DDB
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:Query]
+                Resource:
+                  - !GetAtt AgentMemoryTable.Arn
+                  - !GetAtt AgentRunsTable.Arn
+              # Step Functions
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:SendTaskSuccess
+                  - states:SendTaskFailure
+                Resource: '*'
+              # Bedrock (planner + agent)
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:InvokeAgent
+                Resource: '*'
+              # Secrets Manager (Discord webhook)
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Ref DiscordWebhookSecret
+              # SES send
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+              # KMS for encrypted S3/DDB/SQS
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt DataKmsKey.Arn
+
+  StateMachineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'states-exec-healthcare-${Environment}-${NameSuffix}-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: !Sub 'StepFunctionsInvoke-${Environment}-${NameSuffix}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource: '*'
+              - Effect: Allow
+                Action: [sns:Publish]
+                Resource: !Ref ApprovalTopic
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:GetItem]
+                Resource:
+                  - !GetAtt AgentMemoryTable.Arn
+                  - !GetAtt AgentRunsTable.Arn
+              - Effect: Allow
+                Action: [sqs:SendMessage]
+                Resource: !GetAtt NotificationQueue.Arn
+              # allow Step Functions to use the CMK when services do
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt DataKmsKey.Arn
+
+  # -----------------------------
+  # Bedrock Agent (BLUE)
+  # -----------------------------
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bedrock-agent-role-${Environment}-${NameSuffix}-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock.amazonaws.com }
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: !Sub 'AgentToolAccess-${Environment}-${NameSuffix}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource: '*'
+              - Effect: Allow
+                Action: [sqs:SendMessage]
+                Resource: !GetAtt NotificationQueue.Arn
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+
+  CareCoordinatorToolFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'healthcare-agent-tool-${Environment}-${NameSuffix}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          NOTIFICATION_QUEUE_URL: !Ref NotificationQueue
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          sqs = boto3.client('sqs')
+          def lambda_handler(event, context):
+              body = event if isinstance(event, dict) else {}
+              params = body.get('parameters') or body
+              def parse(v):
+                  if isinstance(v, dict): return v
+                  if isinstance(v, str):
+                      try: return json.loads(v)
+                      except Exception: return {"raw": v}
+                  return {}
+              patient = parse(params.get('patient_data'))
+              analysis = parse(params.get('analysis_result'))
+              if not patient or not analysis:
+                  return {'statusCode':400,'body':'missing parameters'}
+              sqs.send_message(QueueUrl=os.environ['NOTIFICATION_QUEUE_URL'],
+                               MessageBody=json.dumps({'patient_data':patient,'analysis_result':analysis,'source':'agent-tool'}))
+              return {'statusCode':200,'body':'queued'}
+
+  HealthcareAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: !Sub '${AgentName}-${NameSuffix}'
+      Description: 'Agent that assesses patient risk and coordinates follow-ups. (BLUE)'
+      FoundationModel: !Ref FoundationModelId
+      Instruction: |
+        You are a healthcare care-coordination agent. Assess patient risk based on recent lab results.
+        If risk is high, call the "send_care_notification" tool with patient_data and analysis_result.
+        Keep outputs concise and clinical.
+      IdleSessionTTLInSeconds: 900
+      AgentResourceRoleArn: !GetAtt BedrockAgentRole.Arn
+      AutoPrepare: true
+      ActionGroups:
+        - ActionGroupName: send_care_notification
+          ActionGroupState: ENABLED
+          ActionGroupExecutor:
+            Lambda: !GetAtt CareCoordinatorToolFunction.Arn
+          FunctionSchema:
+            Functions:
+              - Name: send_care_notification
+                Description: Queue notifications to care team and patient via SQS.
+                Parameters:
+                  patient_data: { Type: string, Required: true }
+                  analysis_result: { Type: string, Required: true }
+
+  HealthcareAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentAliasName: !Sub '${AgentName}-${NameSuffix}-alias'
+      AgentId: !Ref HealthcareAgent
+
+  # -----------------------------
+  # Tool Lambdas
+  # -----------------------------
+  PlannerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'healthcare-planner-${Environment}-${NameSuffix}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          FOUNDATION_MODEL_ID: !Ref FoundationModelId
+      Code:
+        ZipFile: |
+          import json, os, boto3, uuid
+          br = boto3.client('bedrock-runtime')
+          def lambda_handler(event, context):
+              patient = event.get('patient', {})
+              plan_prompt = f"""
+              You are a clinical workflow planner. For the patient JSON below,
+              output a minimal JSON plan with ordered steps:
+              [ "ParseReport", "VerifyFHIR", "SearchGuideline", "ProposeAction", "DiscordApproval", "ExecuteAction", "SendAppointmentEmail", "WriteMemory", "SummarizeRun" ]
+              Include requiresApproval: true if risk is high or meds discussed.
+              Return ONLY valid JSON with keys: steps, requiresApproval, topic.
+              Patient: {json.dumps(patient)}
+              """
+              model_id = os.environ['FOUNDATION_MODEL_ID']
+              try:
+                  resp = br.invoke_model(
+                      modelId=model_id,
+                      body=json.dumps({"messages":[{"role":"user","content":[{"type":"text","text":plan_prompt}]}]}),
+                      contentType='application/json',
+                      accept='application/json'
+                  )
+                  payload = json.loads(resp['body'].read().decode('utf-8'))
+                  text = None
+                  if 'output' in payload and 'message' in payload['output']:
+                      parts = payload['output']['message'].get('content',[])
+                      text = next((p.get('text') for p in parts if p.get('type')=='output_text'), None)
+              except Exception:
+                  text = None
+              if not text:
+                  text = json.dumps({"steps":["ParseReport","VerifyFHIR","SearchGuideline","ProposeAction","DiscordApproval","ExecuteAction","SendAppointmentEmail","WriteMemory","SummarizeRun"],"requiresApproval":True,"topic":"caregap"})
+              plan = json.loads(text) if text.strip().startswith('{') else {"steps":["ParseReport","VerifyFHIR","SearchGuideline","ProposeAction","DiscordApproval","ExecuteAction","SendAppointmentEmail","WriteMemory","SummarizeRun"],"requiresApproval":True,"topic":"caregap"}
+              run_id = str(uuid.uuid4())
+              return {"plan": plan, "runId": run_id}
+
+  ReportParserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'healthcare-report-parser-${Environment}-${NameSuffix}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 20
+      MemorySize: 256
+      Code:
+        ZipFile: |
+            import json, csv, io
+            from typing import List, Dict, Any, Optional
+
+            SEVERITY_RANK = {
+                "CRITICALLY HIGH": 4,
+                "CRITICAL": 4,
+                "HIGH": 3,
+                "BORDERLINE": 2,
+                "LOW": 1,
+                "NORMAL": 0,
+                None: 0,
+                "": 0
+            }
+
+            def _to_float(x, default=0.0):
+                try:
+                    return float(x)
+                except Exception:
+                    return default
+
+            def _dominant_test(tests: List[Dict[str, Any]]) -> Dict[str, Any]:
+                """Pick the test that best represents the overall risk signal."""
+                if not tests:
+                    return {}
+
+                # Rank by: explicit critical flag → severity flag → absolute z-ish by ref (best-effort)
+                def score(t):
+                    crit = 1 if t.get("is_critical") else 0
+                    sev  = SEVERITY_RANK.get((t.get("flag") or "").upper(), 0)
+                    # small bonus for classic diabetic markers
+                    classic = 1 if (str(t.get("test_code","")).upper() in {"HBA1C","FPG","RPG"} or
+                                    "hba1c" in str(t.get("test_name","")).lower()) else 0
+                    return (crit, sev, classic, _to_float(t.get("result_value"), 0.0))
+
+                return sorted(tests, key=score, reverse=True)[0]
+
+            def _derive_is_critical(test: Dict[str, Any], all_tests: List[Dict[str, Any]]) -> bool:
+                name = (test.get("test_code") or "").upper()
+                label = (test.get("test_name") or "").lower()
+                val = _to_float(test.get("result_value"))
+
+                # Core diabetic rules
+                if name == "HBA1C" or "hba1c" in label:
+                    return val >= 7.0
+                if name == "FPG" or "fasting plasma glucose" in label:
+                    return val >= 126
+                if name == "RPG" or "random plasma glucose" in label:
+                    return val >= 200
+
+                # If any test in the panel is flagged as critically high, lift to critical
+                if any(x.get("is_critical") for x in all_tests):
+                    return True
+
+                # Ketones heuristic: if ketones >= 1.0 AND any glucose very high, raise concern
+                for x in all_tests:
+                    lname = (x.get("test_name") or "").lower()
+                    if "ketone" in lname and _to_float(x.get("result_value")) >= 1.0:
+                        if any(((t.get("test_code") or "").upper() in {"FPG","RPG"} and _to_float(t.get("result_value")) >= 250)
+                               for t in all_tests):
+                            return True
+                return False
+
+            def _collect_abnormal_facts(tests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                out = []
+                for t in tests:
+                    flag = (t.get("flag") or "").upper()
+                    if t.get("is_critical") or flag in {"CRITICAL","CRITICALLY HIGH","HIGH","LOW","BORDERLINE"}:
+                        out.append({
+                            "code": t.get("test_code"),
+                            "name": t.get("test_name"),
+                            "value": t.get("result_value"),
+                            "unit": t.get("unit"),
+                            "flag": t.get("flag"),
+                            "critical": bool(t.get("is_critical", False))
+                        })
+                return out[:12]  # keep it compact
+
+            def lambda_handler(event, context):
+                patient = dict(event.get('patient', {}))
+
+                # Fast path: if caller already provided last_lab_result, annotate critical and return
+                lr = patient.get('last_lab_result')
+
+                # Prefer full report if available (your new payload)
+                report = event.get("lab_report") or patient.get("lab_report")
+                tests = []
+                if isinstance(report, dict):
+                    tests = report.get("tests") or []
+
+                if not lr and isinstance(tests, list) and tests:
+                    dom = _dominant_test(tests)
+                    is_crit = _derive_is_critical(dom, tests)
+                    lr = {
+                        "test_name": dom.get("test_name") or dom.get("test_code") or "Key Marker",
+                        "result_value": _to_float(dom.get("result_value")),
+                        "unit": dom.get("unit"),
+                        "flag": dom.get("flag"),
+                        "is_critical": is_crit,
+                        "source": "panel"
+                    }
+                    patient['last_lab_result'] = lr
+                else:
+                    # ensure is_critical is computed if only single value is present
+                    if isinstance(lr, dict) and "is_critical" not in lr:
+                        lr = dict(lr)
+                        lr["is_critical"] = _derive_is_critical(lr, tests or [lr])
+                        patient['last_lab_result'] = lr
+
+                # Build a handy facts list for downstream messaging
+                abnormal_facts = _collect_abnormal_facts(tests)
+
+                # Done
+                return {
+                    "patient": patient,
+                    "panel_available": bool(tests),
+                    "abnormal_facts": abnormal_facts
+                }
+
+
+  FhirToolFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'healthcare-fhirtool-${Environment}-${NameSuffix}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 20
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              patient = event.get('patient', {})
+              last = patient.get('last_lab_result', {})
+              is_critical = bool(last.get('is_critical'))
+              return {
+                "verified": True,
+                "risk": "high" if is_critical else "low",
+                "facts": {"last_test": last.get('test_name'), "value": last.get('result_value')}
+              }
+
+  SearchGuidelineToolFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'healthcare-guideline-search-${Environment}-${NameSuffix}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 20
+      MemorySize: 256
+      Environment:
+        Variables:
+          BUCKET: !Ref PatientDataBucket
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              facts = event.get('verify', {}).get('facts', {})
+              test = facts.get('last_test', 'HbA1c')
+              snippet = f"Guideline: For {test} above threshold, schedule follow-up and lifestyle counseling; consider medication as per clinician."
+              return {"snippet": snippet, "source": "stub-guideline"}
+
+  ProposeActionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'healthcare-propose-action-${Environment}-${NameSuffix}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          from math import isnan
+
+          # Simple provider rosters for demo (feel free to expand/replace with DDB)
+          PROVIDERS = {
+            "Endocrinology": [
+              {"name": "Dr. A. Endo", "role": "Endocrinologist (MD)"},
+              {"name": "Dr. B. Rao",  "role": "Endocrinologist (MD)"},
+              {"name": "NP C. Jain",  "role": "Nurse Practitioner"}
+            ],
+            "Nephrology": [
+              {"name": "Dr. Shreya Patel", "role": "Nephrologist (MD)"},
+              {"name": "Dr. R. Kulkarni",  "role": "Nephrologist (MD)"}
+            ],
+            "Cardiology / Lipid Clinic": [
+              {"name": "Dr. S. Deshmukh", "role": "Cardiologist (MD)"},
+              {"name": "Dr. V. Singh",     "role": "Cardiologist (MD)"},
+              {"name": "PA T. Menon",      "role": "Physician Assistant"}
+            ],
+            "Primary Care": [
+              {"name": "Assigned PCP", "role": "PCP / NP"}
+            ]
+          }
+
+          # Minimal deterministic triage based on your lab schema
+          def choose_specialty(patient: dict) -> str:
+            tests = patient.get("tests") or []
+            # Helper to fetch first value by code or name (case-insensitive)
+            def get_test(*keys):
+              lk = [k.lower() for k in keys]
+              for t in tests:
+                name = (t.get("test_name") or "").lower()
+                code = (t.get("test_code") or "").lower()
+                if any(k in (name, code) for k in lk):
+                  return t
+              return None
+
+            # 1) Endocrinology — marked hyperglycemia
+            for key in [("hba1c","hbA1c (ngsp)","hba1c (ngsp)"),
+                        ("fpg","fasting plasma glucose"),
+                        ("rpg","random plasma glucose")]:
+              t = get_test(*key)
+              if t:
+                val = float(t.get("result_value") or 0)
+                crit = bool(t.get("is_critical") or (t.get("flag","").upper().startswith("CRIT")))
+                if t and (crit or val >= 7.0 or val >= 180):  # HbA1c>=7% OR glucose>=180
+                  return "Endocrinology"
+
+            # 2) Nephrology — kidney involvement
+            egfr = get_test("egfr", "eGFR (estimated gfr)")
+            if egfr and float(egfr.get("result_value") or 999) < 60:
+              return "Nephrology"
+            alb = get_test("urine_alb","microalbumin","urine microalbumin")
+            if alb and float(alb.get("result_value") or 0) >= 30:
+              return "Nephrology"
+
+            # 3) Cardiology/Lipid clinic — severe dyslipidemia
+            ldl = get_test("ldl","ldl cholesterol")
+            trig= get_test("trig","triglycerides")
+            if (ldl and float(ldl.get("result_value") or 0) >= 160) or \
+               (trig and float(trig.get("result_value") or 0) >= 300):
+              return "Cardiology / Lipid Clinic"
+
+            # 4) Fallback
+            return "Primary Care"
+
+          def pick_provider(dept: str, patient: dict) -> tuple[str, str]:
+            # If the patient has a preferred doctor and dept matches their preference, use that
+            pref_doc  = patient.get("preferred_doctor")
+            pref_dept = patient.get("preferred_department")
+            if pref_doc and (not pref_dept or pref_dept == dept):
+              # Try to guess role from roster or default role per dept
+              role = (PROVIDERS.get(dept, PROVIDERS["Primary Care"])[0].get("role"))
+              return pref_doc, role
+
+            roster = PROVIDERS.get(dept) or PROVIDERS["Primary Care"]
+            return roster[0]["name"], roster[0]["role"]
+
+          def make_followup(dept: str, role: str, prov: str, risk: str) -> dict:
+            # Slightly different defaults by specialty/risk
+            if dept == "Endocrinology":
+              visit = "Clinic visit"
+              dur   = 30 if risk=="high" else 20
+              urg   = "High" if risk=="high" else "Routine"
+              win   = "within 14 days" if risk=="high" else "in 4–12 weeks"
+              notes = "Discuss medication adjustment, SMBG targets, and lifestyle counseling."
+            elif dept == "Nephrology":
+              visit = "Clinic visit"
+              dur   = 30
+              urg   = "High" if risk=="high" else "Routine"
+              win   = "within 14 days" if risk=="high" else "in 4–8 weeks"
+              notes = "Review eGFR trajectory and albuminuria; consider ACE/ARB as appropriate."
+            elif dept == "Cardiology / Lipid Clinic":
+              visit = "Clinic visit"
+              dur   = 30
+              urg   = "Moderate" if risk=="high" else "Routine"
+              win   = "within 4 weeks" if risk=="high" else "in 6–12 weeks"
+              notes = "Discuss statin therapy and lifestyle measures; consider secondary causes."
+            else:
+              visit = "Clinic or telehealth"
+              dur   = 20
+              urg   = "Routine"
+              win   = "in 4–12 weeks"
+              notes = "Recheck labs at next visit; continue current plan."
+
+            return {
+              "department": dept,
+              "provider_role": role,
+              "provider_name": prov,
+              "visit_type": visit,
+              "duration_min": dur,
+              "urgency": urg,
+              "window": win,
+              "notes": notes
+            }
+
+          def lambda_handler(event, context):
+            verify   = event.get('verify', {}) or {}
+            guideline= event.get('guideline', {}) or {}
+            patient  = (event.get('patient') or event.get('parsed',{}).get('patient') or {}) or {}
+
+            # risk from VerifyFHIR
+            risk = (verify.get('risk') or 'low').lower()
+
+            # specialty selection driven by patient tests (or fallback)
+            dept = choose_specialty(patient)
+            prov, role = pick_provider(dept, patient)
+
+            actions = ["Notify care team","Schedule follow-up"] if risk=="high" else ["Routine follow-up"]
+            patient_msg = (
+              "Your recent results require a follow-up. Please contact your provider."
+              if risk=="high" else
+              "Your results look fine; keep up the healthy routine."
+            )
+
+            followup = make_followup(dept, role, prov, risk)
+
+            return {
+              "analysis_result": {
+                "risk_assessment": risk,
+                "recommended_actions": actions,
+                "guideline_snippet": guideline.get('snippet')
+              },
+              "followup": followup,
+              "patient_message": patient_msg
+            }
+
+
+
+  ExecuteActionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'healthcare-exec-action-${Environment}-${NameSuffix}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 20
+      MemorySize: 256
+      Environment:
+        Variables:
+          NOTIFICATION_QUEUE_URL: !Ref NotificationQueue
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          sqs = boto3.client('sqs')
+          def lambda_handler(event, context):
+              patient = event.get('patient',{})
+              proposal = event.get('proposal',{})
+              body = {"patient_data": patient, "analysis_result": proposal.get("analysis_result"), "source": "state-machine"}
+              sqs.send_message(QueueUrl=os.environ['NOTIFICATION_QUEUE_URL'], MessageBody=json.dumps(body))
+              return {"queued": True}
+
+  AppointmentMailerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'healthcare-appointment-mailer-${Environment}-${NameSuffix}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 20
+      MemorySize: 256
+      Environment:
+        Variables:
+          RUNS_TABLE: !Ref AgentRunsTable
+          SES_FROM: !Ref SesFromEmail
+          DISCORD_WEBHOOK_URL: !Ref DiscordWebhookUrl
+          DISCORD_SECRET_ARN: !Ref DiscordWebhookSecret
+          REPORT_BASE_URL: !Sub 'https://${PatientHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/report/html'
+      Code:
+        ZipFile: |
+            import os, json, urllib.request, urllib.error, boto3, time, logging, datetime
+            from datetime import timedelta
+            from email.utils import formatdate
+
+            log = logging.getLogger()
+            log.setLevel(getattr(logging, os.getenv("LOG_LEVEL","INFO").upper(), logging.INFO))
+
+            ses = boto3.client('ses')
+            sm  = boto3.client('secretsmanager')
+            ddb = boto3.client('dynamodb')
+
+            # --- Config / Branding ---
+            CLINIC_NAME    = os.getenv("CLINIC_NAME", "CityCare Clinic")
+            CLINIC_PHONE   = os.getenv("CLINIC_PHONE", "(555) 010-1234")
+            CLINIC_ADDRESS = os.getenv("CLINIC_ADDRESS", "123 Health Way, Suite 200, Mumbai, Maharashtra, India")
+            DEFAULT_TZ     = os.getenv("DEFAULT_TZ", "Asia/Kolkata")
+
+            def _resolve_webhook():
+                url = os.environ.get("DISCORD_WEBHOOK_URL")
+                if url: 
+                    return url
+                arn = os.environ.get("DISCORD_SECRET_ARN")
+                if not arn:
+                    raise RuntimeError("No DISCORD_WEBHOOK_URL or DISCORD_SECRET_ARN")
+                return sm.get_secret_value(SecretId=arn)['SecretString']
+
+            def _post_discord(payload: dict):
+                url = _resolve_webhook()
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                data = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(
+                    url, data=data, method="POST",
+                    headers={"Content-Type":"application/json","Accept":"application/json","User-Agent":"curl/8.5.0"}
+                )
+                try:
+                    with opener.open(req, timeout=10) as r:
+                        body = r.read().decode("utf-8", "ignore")
+                        log.info({"msg":"discord_post_ok","status":r.status,"body":body[:200]})
+                        return True
+                except urllib.error.HTTPError as e:
+                    details = e.read().decode("utf-8", "ignore")
+                    log.error({"msg":"discord_http_error","code":e.code,"details":details[:400]})
+                    return False
+                except Exception:
+                    log.exception("discord_post_failed")
+                    return False
+
+            def _trace(run_id: str, step: str, status: str, detail: dict):
+                if not run_id:
+                    log.warning({"msg":"trace_without_run_id","step":step,"status":status,"detail":detail})
+                    return
+                try:
+                    ddb.put_item(
+                        TableName=os.environ["RUNS_TABLE"],
+                        Item={
+                          "runId":{"S":run_id},"ts":{"N":str(int(time.time()))},
+                          "step":{"S":f"discord:{step}"},"status":{"S":status},"detail":{"S":json.dumps(detail or {})}
+                        })
+                    log.info({"msg":"trace_written","runId":run_id,"step":step,"status":status})
+                except Exception:
+                    log.exception("trace_write_failed")
+
+            def _safe_preview(obj, limit=4000):
+                try:
+                    s = json.dumps(obj, default=str)
+                except Exception:
+                    s = str(obj)
+                return s if len(s) <= limit else s[:limit] + "...(truncated)"
+
+            def _extract_patient(event: dict):
+                candidates = [
+                    ("event.patient",           (event or {}).get("patient")),
+                    ("event.parsed.patient",    (event or {}).get("parsed",{}).get("patient")),
+                    ("event.input.patient",     (event or {}).get("input",{}).get("patient")),
+                    ("event.detail.patient",    (event or {}).get("detail",{}).get("patient")),
+                ]
+                for where, obj in candidates:
+                    if isinstance(obj, dict) and obj:
+                        return obj, where
+                return {}, "not_found"
+
+            def _extract_run_id(event: dict):
+                if event.get("runId"):
+                    return event["runId"], "event.runId"
+                if event.get("planOut",{}).get("runId"):
+                    return event["planOut"]["runId"], "event.planOut.runId"
+                return None, "not_found"
+
+            def _abbrev_lab_facts(event: dict, patient: dict):
+                """
+                Build a compact list of abnormal facts from event.abnormal_facts
+                (preferred) or fall back to patient.last_lab_result.
+                """
+                facts = event.get("abnormal_facts") or []
+                out = []
+                if isinstance(facts, list) and facts:
+                    for f in facts[:6]:
+                        name = f.get("name") or f.get("code") or "Marker"
+                        val  = f.get("value")
+                        unit = f.get("unit")
+                        flag = f.get("flag")
+                        crit = " (critical)" if f.get("critical") else ""
+                        if val is None:
+                            line = f"- {name}{crit}"
+                        else:
+                            line = f"- {name}: {val}{(' ' + unit) if unit else ''}{crit}{(' — ' + flag) if flag else ''}"
+                        out.append(line)
+                else:
+                    lr = (patient or {}).get("last_lab_result") or {}
+                    if lr:
+                        name = lr.get("test_name") or "Key marker"
+                        val  = lr.get("result_value")
+                        unit = lr.get("unit")
+                        crit = " (critical)" if lr.get("is_critical") else ""
+                        line = f"- {name}: {val}{(' ' + unit) if unit else ''}{crit}"
+                        out.append(line)
+                return out
+
+            def _pick_future_slot(urgency: str):
+                """Return (iso_date, pretty_date_local, pretty_time_local) naive (no TZ math).
+                   For demo: next business day 10:00 (High) or +7 days 10:00 (Routine).
+                """
+                now = datetime.datetime.utcnow()
+                if (urgency or "").lower() == "high":
+                    days = 1
+                else:
+                    days = 7
+                # Move to a weekday if needed
+                target = now + timedelta(days=days)
+                while target.weekday() >= 5:  # 5=Sat,6=Sun
+                    target += timedelta(days=1)
+                target = target.replace(hour=10, minute=0, second=0, microsecond=0)
+                # We aren't doing full tz conversion to keep dependencies minimal
+                iso = target.isoformat() + "Z"
+                pretty_date = target.strftime("%A, %b %d, %Y")
+                pretty_time = "10:00 AM"
+                return iso, pretty_date, pretty_time
+
+            def _build_email(patient, proposal, verify, guideline_snippet, facts_lines):
+                pn   = patient.get("patient_name","Patient")
+                to   = patient.get("patient_email") or patient.get("email")
+                pid  = patient.get("patient_id","—")
+
+                analysis = (proposal or {}).get("analysis_result", {}) or {}
+                risk     = (analysis.get("risk_assessment") or verify.get("risk") or "low").capitalize()
+                follow   = (proposal or {}).get("followup", {}) or {}
+
+                dept     = follow.get("department","Endocrinology")
+                prov     = follow.get("provider_name", "On-call Endocrinology")
+                prole    = follow.get("provider_role", "MD")
+                vtype    = follow.get("visit_type","Clinic visit")
+                dur      = follow.get("duration_min", 30)
+                urg      = follow.get("urgency","High")
+                window   = follow.get("window","within 14 days")
+                notes    = follow.get("notes","Review labs; adjust plan.")
+
+                appt_iso, appt_date, appt_time = _pick_future_slot(urg)
+
+                actions = analysis.get("recommended_actions") or []
+                actions_lines = "\n".join(f"• {a}" for a in actions) if actions else "• Follow-up as advised."
+
+                facts_block = "\n".join(facts_lines) if facts_lines else "—"
+
+                # Short guideline line
+                guide = guideline_snippet or "Follow-up per clinician judgment based on abnormal results."
+
+                subj = f"Follow-up suggested for {pn} — {dept}"
+                text = f"""Hello {pn},
+
+            We reviewed your recent lab results. Based on the findings, your current risk level is: {risk}.
+
+            Key results:
+            {facts_block}
+
+            Guideline:
+            {guide}
+
+            Recommended next steps:
+            {actions_lines}
+
+            Suggested appointment:
+            • Department: {dept}
+            • Provider: {prov} ({prole})
+            • Visit type & duration: {vtype}, {dur} minutes
+            • Urgency & window: {urg}, {window}
+            • Suggested slot: {appt_date} at {appt_time} ({DEFAULT_TZ})
+
+            Clinic:
+            {CLINIC_NAME}
+            {CLINIC_ADDRESS}
+            Phone: {CLINIC_PHONE}
+
+            If the time doesn’t work, feel free to propose another. If you have symptoms like nausea, vomiting, abdominal pain, or confusion, seek urgent care.
+
+            Patient ID: {pid}
+            Sent: {formatdate(usegmt=True)}
+
+            — Care Coordination Team
+            """
+
+                html = f"""<!doctype html>
+            <html>
+              <body style="font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; line-height:1.45; color:#111">
+                <p>Hello {pn},</p>
+                <p>We reviewed your recent lab results. Based on the findings, your current risk level is: <b>{risk}</b>.</p>
+
+                <h3 style="margin-bottom:4px">Key results</h3>
+                <pre style="background:#f6f7f9; padding:12px; border-radius:8px; white-space:pre-wrap">{facts_block}</pre>
+
+                <h3 style="margin-bottom:4px">Guideline</h3>
+                <p>{guide}</p>
+
+                <h3 style="margin-bottom:4px">Recommended next steps</h3>
+                <ul>
+                  {''.join(f'<li>{a}</li>' for a in actions) if actions else '<li>Follow-up as advised.</li>'}
+                </ul>
+
+                <h3 style="margin-bottom:4px">Suggested appointment</h3>
+                <ul>
+                  <li><b>Department:</b> {dept}</li>
+                  <li><b>Provider:</b> {prov} ({prole})</li>
+                  <li><b>Visit type & duration:</b> {vtype}, {dur} minutes</li>
+                  <li><b>Urgency & window:</b> {urg}, {window}</li>
+                  <li><b>Suggested slot:</b> {appt_date} at {appt_time} ({DEFAULT_TZ})</li>
+                </ul>
+
+                <h3 style="margin-bottom:4px">{CLINIC_NAME}</h3>
+                <p style="margin:0">{CLINIC_ADDRESS}<br/>Phone: {CLINIC_PHONE}</p>
+
+                <p style="margin-top:16px; color:#444; font-size:12px">
+                  If the time doesn’t work, feel free to propose another. If you have symptoms like nausea, vomiting,
+                  abdominal pain, or confusion, seek urgent care.
+                  <br/>Patient ID: {pid} • Sent: {formatdate(usegmt=True)}
+                </p>
+
+                <p style="margin-top:12px">— Care Coordination Team</p>
+              </body>
+            </html>
+            """
+                return subj, text, html, appt_iso, {"dept":dept, "provider":prov, "role":prole, "when":f"{appt_date} {appt_time} {DEFAULT_TZ}"}
+
+            def lambda_handler(event, context):
+                # Loud entry logging
+                log.info({"msg":"AppointmentMailer invoked", "keys": list(event.keys())})
+                log.info({"msg":"full_event_preview", "event": _safe_preview(event)})
+
+                patient, patient_where = _extract_patient(event)
+                log.info({"msg":"patient_location", "where": patient_where, "patient_preview": _safe_preview(patient)})
+
+                run_id, run_where = _extract_run_id(event)
+                log.info({"msg":"run_id_location", "where": run_where, "run_id": run_id})
+
+                # detect email (accept both 'patient_email' and 'email')
+                to = (patient.get("patient_email") 
+                      or patient.get("email") 
+                      or event.get("patient_email") 
+                      or event.get("email"))
+                if to:
+                    log.info({"msg":"patient_email_detected","email":to})
+                else:
+                    log.warning("patient_email NOT present in patient or top-level event")
+                    _post_discord({"content":"⚠️ No patient_email present; skipping email."})
+                    _trace(run_id, "email", "SKIPPED", {"reason":"no patient_email","patient_where":patient_where})
+                    return {"sent": False, "reason": "no patient_email", "patient_where": patient_where}
+
+                    follow   = (proposal.get("followup") or {})
+                    risk     = (proposal.get('analysis_result') or {}).get('risk_assessment','low')
+                    dept     = follow.get("department") or patient.get("preferred_department") or ("Endocrinology" if risk=="high" else "Primary Care")
+                    prov     = follow.get("provider_name") or patient.get("preferred_doctor") or ("On-call Endocrinology" if risk=="high" else "Assigned PCP")
+                    visit    = follow.get("visit_type","Clinic visit")
+                    dur_min  = follow.get("duration_min", 30 if risk=="high" else 20)
+                    window   = follow.get("window","within 14 days" if risk=="high" else "in 4–12 weeks")
+                    clinic   = "City Health Clinic"
+
+                    # suggest slot (same heuristic)
+                    from datetime import datetime, timedelta
+                    days = 3 if str(risk).lower()=="high" else 14
+                    slot_dt = datetime.now() + timedelta(days=days)
+                    slot_dt = slot_dt.replace(hour=10, minute=30, second=0, microsecond=0)
+                    slot_date = slot_dt.date().isoformat()
+                    slot_time = slot_dt.strftime("%H:%M")
+
+                    # report link
+                    report_base = os.environ.get("REPORT_BASE_URL")
+                    report_url = f"{report_base}?patientId={urllib.parse.quote(patient.get('patient_id',''))}" if report_base else None
+
+                    text_body = f"""Dear {patient.get('patient_name','Patient')},
+
+                    Your recent lab results suggest that you would benefit from a follow-up appointment.
+
+                    Summary:
+                    • Risk level: {str(risk).upper()}
+                    • Department: {dept}
+                    • Provider: {prov}
+                    • Visit type: {visit} ({dur_min} min)
+                    • Suggested appointment window: {window}
+                    • Suggested slot: {slot_date} at {slot_time}
+                    • Clinic: {clinic}
+                    {('• Report: ' + report_url) if report_url else ''}
+
+                    Recommended next steps:
+                    1) Confirm or reschedule this appointment via your patient portal.
+                    2) Bring your medication list and recent glucose readings (if available).
+                    3) If you have any concerning symptoms (nausea, vomiting, abdominal pain, confusion), please seek urgent care.
+
+                    Best regards,
+                    {clinic} Care Team
+                    (Automated notification — demo)
+                    """
+
+                    html_body = f"""<!doctype html><html><body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial">
+                    <p>Dear {patient.get('patient_name','Patient')},</p>
+                    <p>Your recent lab results suggest that you would benefit from a follow-up appointment.</p>
+                    <table style="border-collapse:collapse">
+                    <tr><td style="padding:6px 10px;border:1px solid #ddd"><b>Risk level</b></td><td style="padding:6px 10px;border:1px solid #ddd">{str(risk).upper()}</td></tr>
+                    <tr><td style="padding:6px 10px;border:1px solid #ddd"><b>Department</b></td><td style="padding:6px 10px;border:1px solid #ddd">{dept}</td></tr>
+                    <tr><td style="padding:6px 10px;border:1px solid #ddd"><b>Provider</b></td><td style="padding:6px 10px;border:1px solid #ddd">{prov}</td></tr>
+                    <tr><td style="padding:6px 10px;border:1px solid #ddd"><b>Visit</b></td><td style="padding:6px 10px;border:1px solid #ddd">{visit} • {dur_min} min</td></tr>
+                    <tr><td style="padding:6px 10px;border:1px solid #ddd"><b>Window</b></td><td style="padding:6px 10px;border:1px solid #ddd">{window}</td></tr>
+                    <tr><td style="padding:6px 10px;border:1px solid #ddd"><b>Suggested slot</b></td><td style="padding:6px 10px;border:1px solid #ddd">{slot_date} at {slot_time}</td></tr>
+                    <tr><td style="padding:6px 10px;border:1px solid #ddd"><b>Clinic</b></td><td style="padding:6px 10px;border:1px solid #ddd">{clinic}</td></tr>
+                    {"<tr><td style='padding:6px 10px;border:1px solid #ddd'><b>Report</b></td><td style='padding:6px 10px;border:1px solid #ddd'><a href='"+report_url+"' target='_blank'>Open patient report</a></td></tr>" if report_url else ""}
+                    </table>
+                    <p><b>Recommended next steps</b>:</p>
+                    <ol>
+                    <li>Confirm or reschedule this appointment via your patient portal.</li>
+                    <li>Bring your medication list and recent glucose readings (if available).</li>
+                    <li>If you have any concerning symptoms (nausea, vomiting, abdominal pain, confusion), please seek urgent care.</li>
+                    </ol>
+                    <p>Best regards,<br>{clinic} Care Team<br><span style="opacity:.7">Automated notification — demo</span></p>
+                    </body></html>"""
+
+                    log.info({"msg":"attempt_ses_send","to":to,"risk":risk,"dept":dept,"prov":prov})
+                    try:
+                        resp = ses.send_email(
+                            Source=os.environ['SES_FROM'],
+                            Destination={"ToAddresses":[to]},
+                            Message={
+                                "Subject":{"Data":"Follow-up Appointment Recommendation"},
+                                "Body":{
+                                    "Text":{"Data":text_body},
+                                    "Html":{"Data":html_body}
+                                }
+                            }
+                        )
+
+                    log.info({"msg":"ses_send_ok","messageId":resp.get("MessageId")})
+
+                    _post_discord({
+                      "content": (
+                        f"📧 Email sent to **{patient.get('patient_name','(unknown)')}** `<{to}>` "
+                        f"(risk: **{(analysis.get('risk_assessment') or verify.get('risk') or 'low').upper()}**)\n"
+                        f"Appointment: **{appt_meta['when']}**, Dept **{appt_meta['dept']}**, Provider **{appt_meta['provider']}** ({appt_meta['role']})"
+                      )
+                    })
+                    _trace(run_id, "email", "SENT", {
+                        "to":to, 
+                        "subject":subj,
+                        "appt": appt_meta
+                    })
+                    return {"sent": True, "messageId": resp.get("MessageId"), "appointment": appt_meta}
+
+                except Exception as e:
+                    log.exception("SES send failed")
+                    _post_discord({"content": f"⚠️ Failed to send email to `{to}` — {str(e)}"})
+                    _trace(run_id, "email", "ERROR", {"to":to, "error": str(e)})
+                    return {"sent": False, "error": str(e)}
+
+
+
+
+  WriteMemoryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'healthcare-memory-write-${Environment}-${NameSuffix}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+          Variables:
+            MEM_TABLE: !Ref AgentMemoryTable
+            RUNS_TABLE: !Ref AgentRunsTable
+            KMS_KEY_ARN: arn:aws:kms:us-west-2:663800986524:key/1c50cca1-8a7d-4d94-b0bd-2ec3fed28b49
+      Code:
+        ZipFile: |
+            import json, os, boto3, time, base64, hashlib
+            ddb = boto3.client('dynamodb')
+            kms = boto3.client('kms')
+
+            def _b64e(b: bytes) -> str:
+                return base64.b64encode(b).decode('ascii')
+
+            def _kms_encrypt(key_arn: str, pt: bytes, ec: dict):
+                resp = kms.encrypt(KeyId=key_arn, Plaintext=pt, EncryptionContext=ec)
+                return {"alg":"AWS-KMS","ciphertext_b64": _b64e(resp["CiphertextBlob"]), "key_hint": key_arn.split("/")[-1][:8]}
+
+            def _kms_encrypt_json(key_arn: str, obj, ec: dict):
+                return _kms_encrypt(key_arn, json.dumps(obj,separators=(',',':')).encode('utf-8'), ec)
+
+            def _kms_encrypt_str(key_arn: str, s: str, ec: dict):
+                return _kms_encrypt(key_arn, (s or "").encode('utf-8'), ec)
+
+            def _demo_encrypt_json(obj):
+                # NOT secure – just for demo so fields aren’t null
+                return {"alg":"BASE64-DEMO","data_b64": _b64e(json.dumps(obj,separators=(',',':')).encode('utf-8'))}
+
+            def _demo_encrypt_str(s: str):
+                return {"alg":"BASE64-DEMO","data_b64": _b64e((s or "").encode('utf-8'))}
+
+            def lambda_handler(event, context):
+                patient  = event.get('patient',{}) or {}
+                proposal = event.get('proposal',{}) or {}
+                plan     = event.get('plan',{}) or {}
+                topic    = plan.get('topic','caregap')
+
+                patient_id = patient.get('patient_id','unknown')
+                pk = f"patient#{patient_id}"
+                sk = f"{topic}#latest"
+
+                risk       = (proposal.get('analysis_result') or {}).get('risk_assessment','na')
+                actions    = (proposal.get('analysis_result') or {}).get('recommended_actions',[])
+                followup   = proposal.get('followup',{}) or {}
+                email      = patient.get('patient_email') or patient.get('email')
+
+                key_arn  = (os.environ.get('KMS_KEY_ARN') or '').strip()
+                ec       = {"table": os.environ['MEM_TABLE'], "patient_id": patient_id, "topic": topic}
+
+                enc_email   = None
+                email_sha   = None
+                enc_actions = None
+                enc_follow  = None
+                mode = "DEMO"
+
+                # Try KMS first; if it fails, fall back to BASE64-DEMO so UI still shows something non-null
+                if key_arn:
+                    try:
+                        if isinstance(email, str) and email:
+                            enc_email = _kms_encrypt_str(key_arn, email, ec)
+                            email_sha = hashlib.sha256(email.encode('utf-8')).hexdigest()
+                        enc_actions = _kms_encrypt_json(key_arn, actions, ec)
+                        if followup:
+                            enc_follow = _kms_encrypt_json(key_arn, followup, ec)
+                        mode = "KMS"
+                    except Exception as e:
+                        # Fall back to demo mode (non-fatal)
+                        enc_email   = _demo_encrypt_str(email or "")
+                        enc_actions = _demo_encrypt_json(actions)
+                        if followup:
+                            enc_follow = _demo_encrypt_json(followup)
+                        if isinstance(email, str) and email:
+                            email_sha = hashlib.sha256(email.encode('utf-8')).hexdigest()
+                        mode = f"DEMO_FALLBACK:{type(e).__name__}"
+                else:
+                    # No KMS configured – demo mode
+                    if isinstance(email, str) and email:
+                        enc_email = _demo_encrypt_str(email)
+                        email_sha = hashlib.sha256(email.encode('utf-8')).hexdigest()
+                    enc_actions = _demo_encrypt_json(actions)
+                    if followup:
+                        enc_follow = _demo_encrypt_json(followup)
+                    mode = "DEMO"
+
+                item = {
+                    "pk":     {"S": pk},
+                    "sk":     {"S": sk},
+                    "ts":     {"N": str(int(time.time()))},
+                    "risk":   {"S": risk},
+                    "mode":   {"S": mode},
+                    # keep plaintext for internal views/derivations
+                    "actions":  {"S": json.dumps(actions)},
+                    "followup": {"S": json.dumps(followup or {})},
+                }
+                if email_sha:
+                    item["patient_email_sha256"] = {"S": email_sha}
+                if enc_email:
+                    item["patient_email_enc"] = {"S": json.dumps(enc_email)}
+                if enc_actions:
+                    item["actions_enc"] = {"S": json.dumps(enc_actions)}
+                if enc_follow:
+                    item["followup_enc"] = {"S": json.dumps(enc_follow)}
+
+                ddb.put_item(TableName=os.environ['MEM_TABLE'], Item=item)
+                return {"memoryWritten": True, "mode": mode, "hasEmail": bool(email), "storedFollowup": bool(followup)}
+
+
+
+
+
+  SummarizeRunFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'healthcare-run-summarize-${Environment}-${NameSuffix}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          RUNS_TABLE: !Ref AgentRunsTable
+      Code:
+        ZipFile: |
+          import json, os, boto3, time
+          ddb = boto3.client('dynamodb')
+          def lambda_handler(event, context):
+              run_id = event.get('runId')
+              ddb.put_item(
+                TableName=os.environ['RUNS_TABLE'],
+                Item={
+                  "runId":{"S":run_id or str(int(time.time()))},
+                  "summary":{"S":json.dumps(event)}
+                }
+              )
+              return {"logged": True}
+
+  # -----------------------------
+  # Discord Approval (callback pattern)
+  # -----------------------------
+  DiscordApprovalFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'healthcare-discord-approval-${Environment}-${NameSuffix}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 20
+      MemorySize: 256
+      Environment:
+        Variables:
+          RUNS_TABLE: !Ref AgentRunsTable
+          DISCORD_WEBHOOK_URL: !Ref DiscordWebhookUrl
+          DISCORD_SECRET_ARN: !Ref DiscordWebhookSecret
+          APPROVAL_BASE_URL: !Sub 'https://${PatientHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/approve'
+      Code:
+        ZipFile: |
+            import os, json, urllib.request, urllib.parse, urllib.error, boto3, time, base64, logging   
+            log = logging.getLogger()
+            log.setLevel(getattr(logging, os.getenv("LOG_LEVEL","INFO").upper(), logging.INFO))
+
+            sm  = boto3.client('secretsmanager')
+            ddb = boto3.client('dynamodb')
+
+            def _resolve_webhook():
+                url = os.environ.get("DISCORD_WEBHOOK_URL")
+                if url: return url
+                arn = os.environ.get("DISCORD_SECRET_ARN")
+                if not arn: raise RuntimeError("No DISCORD_WEBHOOK_URL or DISCORD_SECRET_ARN")
+                return sm.get_secret_value(SecretId=arn)['SecretString']
+
+            def _truncate(s, n):
+                if s is None: return ""
+                if len(s) <= n: return s
+                return s[: max(0, n-1)] + "…"
+
+            def _post_discord(payload: dict):
+                url = _resolve_webhook()
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                data = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(
+                    url, data=data, method="POST",
+                    headers={"Content-Type":"application/json","Accept":"application/json","User-Agent":"curl/8.5.0"}
+                )
+                with opener.open(req, timeout=10) as r:
+                    body = r.read().decode("utf-8", "ignore")
+                    log.info({"msg":"discord_posted","status":r.status,"body":body[:200]})
+
+            def _trace(run_id: str, step: str, status: str, detail: dict):
+                if not run_id: 
+                    log.warning({"msg":"_trace called without run_id","step":step,"status":status})
+                    return
+                try:
+                    ddb.put_item(
+                      TableName=os.environ["RUNS_TABLE"],
+                      Item={
+                        "runId":{"S":run_id},"ts":{"N":str(int(time.time()))},
+                        "step":{"S":f"discord:{step}"},"status":{"S":status},"detail":{"S":json.dumps(detail or {})}
+                      })
+                    log.info({"msg":"trace_written","runId":run_id,"step":step,"status":status})
+                except Exception:
+                    log.exception("trace_write_failed")
+
+            def _fmt_steps(steps):
+                if not isinstance(steps, list): return "—"
+                out = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
+                return _truncate(out, 1024)
+
+            def lambda_handler(event, context):
+                # entry logging
+                try:
+                    preview = json.dumps(event)[:1000]
+                except Exception:
+                    preview = str(event)[:1000]
+                log.info({"msg":"DiscordApproval invoked","preview":preview})
+                print("DiscordApproval: handler entered", flush=True)
+
+                token   = event.get("taskToken")
+                patient = event.get("patient",{}) or {}
+                proposal= event.get("proposal",{}) or {}
+                planOut = event.get("planOut",{}) or {}
+                run_id  = event.get("runId") or planOut.get("runId")
+                log.info({"msg":"context","has_token":bool(token),"run_id":run_id})
+
+                if not token:
+                    _trace(run_id, "approval", "ERROR", {"reason":"missing taskToken"})
+                    return {"posted": False, "reason": "missing taskToken"}
+
+                # short, URL-safe token
+                t_b64 = base64.urlsafe_b64encode(token.encode("utf-8")).decode("ascii")
+                base  = os.environ['APPROVAL_BASE_URL']
+                approve_url = f"{base}?decision=approve&t={t_b64}"
+                reject_url  = f"{base}?decision=reject&t={t_b64}"
+
+                risk      = ((proposal.get('analysis_result') or {}).get('risk_assessment','?')).upper()
+                actions   = (proposal.get('analysis_result') or {}).get('recommended_actions',[]) or ["—"]
+                followup  = proposal.get("followup") or {}
+                steps     = (planOut.get("plan") or {}).get("steps") or []
+
+                content = _truncate(f"Approval needed for **{patient.get('patient_name','(unknown)')}**", 180)
+
+                embed = {
+                  "title": _truncate(f"Approval needed — {patient.get('patient_name','(unknown)')}", 256),
+                  "description": _truncate(
+                    f"**Patient ID:** `{patient.get('patient_id','?')}`\n**Risk:** **{risk}**",
+                    4096
+                  ),
+                  "fields": [
+                    {"name":"Actions","value": _truncate("\n".join(actions) or "—", 1024), "inline": False},
+                    {"name":"Follow-up","value": _truncate(
+                       (f"Department: **{followup.get('department','—')}**\n"
+                        f"Provider: **{followup.get('provider_name','—')}** ({followup.get('provider_role','—')})\n"
+                        f"Visit: {followup.get('visit_type','—')} • {followup.get('duration_min','—')} min\n"
+                        f"Urgency: **{followup.get('urgency','—')}** • Window: **{followup.get('window','—')}**\n"
+                        f"Notes: {followup.get('notes','—')}"), 1024), "inline": False},
+                    {"name":"Plan Steps","value": _fmt_steps(steps), "inline": False},
+                    {"name":"Approve","value": _truncate(approve_url, 1024), "inline": False},
+                    {"name":"Reject","value": _truncate(reject_url, 1024), "inline": False},
+                    {"name":"Patient Contact","value": _truncate(patient.get('patient_email') or "—", 1024), "inline": True},
+                    {"name":"Run ID","value": _truncate(run_id or "—", 1024), "inline": True}
+                  ],
+                  "timestamp": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                }
+
+                try:
+                    _post_discord({"content": content, "embeds": [embed]})
+                    _trace(run_id, "approval", "SENT", {"patient":patient.get("patient_id"), "risk":risk})
+                    return {"posted": True}
+                except urllib.error.HTTPError as e:
+                    details = e.read().decode("utf-8", "ignore")
+                    log.error({"msg":"discord_http_error","code":e.code,"details":details[:400]})
+                    _trace(run_id, "approval", "ERROR", {"http": e.code, "details": details[:400]})
+                    raise
+                except Exception:
+                    log.exception("discord_post_failed")
+                    _trace(run_id, "approval", "ERROR", {"error": "post_failed"})
+                    raise
+
+
+  ApprovalCallbackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'healthcare-approval-callback-${Environment}-${NameSuffix}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json, urllib.parse, boto3, logging, base64, botocore
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+          sfn = boto3.client('stepfunctions')
+
+          def _resp(status, html_text):
+              return {
+                "statusCode": status,
+                "headers": {
+                  "Content-Type": "text/html; charset=utf-8",
+                  "Access-Control-Allow-Origin": "*"
+                },
+                "body": f"<!doctype html><html><head><meta charset='utf-8'><title>Approval</title></head><body style='font-family:system-ui;padding:24px'>{html_text}</body></html>"
+              }
+
+          def _candidates_from_query(qs: dict):
+              cands = []
+              t_b64 = qs.get("t")
+              if t_b64:
+                  try:
+                      tok = base64.urlsafe_b64decode(t_b64.encode("ascii")).decode("utf-8")
+                      cands.append(tok)
+                  except Exception as e:
+                      log.warning({"msg":"bad base64 token", "error":str(e)})
+              raw = qs.get("token")
+              if raw:
+                  cands.append(raw)
+                  cands.append(urllib.parse.unquote(raw))
+                  cands.append(urllib.parse.unquote_plus(raw))
+                  cands.append(raw.replace(" ", "+"))
+              out, seen = [], set()
+              for t in cands:
+                  if not t: continue
+                  k = (t[:6], len(t), t[-6:])
+                  if k in seen: continue
+                  seen.add(k)
+                  out.append(t)
+              return out
+
+          def lambda_handler(event, context):
+              qs = event.get("queryStringParameters") or {}
+              decision = (qs.get("decision") or "reject").lower().strip()
+              candidates = _candidates_from_query(qs)
+              if not candidates:
+                  return _resp(400, "<h2>Missing token</h2><p>No task token was provided.</p>")
+              last_err = None
+              for i, token in enumerate(candidates, 1):
+                  log.info({"attempt": i, "decision": decision, "token_len": len(token)})
+                  try:
+                      if decision == "approve":
+                          sfn.send_task_success(taskToken=token, output=json.dumps({"approved": True}))
+                          return _resp(200, "<h2>✅ Approved</h2><p>Thanks! The workflow has resumed.</p>")
+                      else:
+                          sfn.send_task_failure(taskToken=token, error="Rejected", cause="Human rejected in Discord")
+                          return _resp(200, "<h2>❌ Rejected</h2><p>Your decision has been recorded.</p>")
+                  except botocore.exceptions.ClientError as e:
+                      last_err = e
+                      code = e.response.get("Error",{}).get("Code","")
+                      msg  = e.response.get("Error",{}).get("Message","")
+                      log.warning({"attempt":i, "code":code, "message":msg})
+                      continue
+                  except Exception as e:
+                      last_err = e
+                      log.exception("Unexpected error when signaling Step Functions")
+                      continue
+              return _resp(500, "<h2>⚠️ Error</h2><p>We couldn’t record your decision. Please try again or contact an admin.</p>")
+
+  # -----------------------------
+  # Step Functions
+  # -----------------------------
+  CareGapStateMachine:
+      Type: AWS::StepFunctions::StateMachine
+      Properties:
+        StateMachineName: !Sub 'healthcare-caregap-${Environment}-${NameSuffix}'
+        RoleArn: !GetAtt StateMachineExecutionRole.Arn
+        DefinitionString:
+          Fn::Sub: |
+            {
+              "Comment": "CareGap Agent Plan-and-Act (BLUE)",
+              "StartAt": "Plan",
+              "States": {
+                "Plan": {
+                  "Type": "Task",
+                  "Resource": "${PlannerFunction.Arn}",
+                  "InputPath": "$",
+                  "ResultPath": "$.planOut",
+                  "Next": "ParseReport"
+                },
+                "ParseReport": {
+                  "Type": "Task",
+                  "Resource": "${ReportParserFunction.Arn}",
+                  "InputPath": "$",
+                  "ResultPath": "$.parsed",
+                  "Next": "VerifyFHIR"
+                },
+                "VerifyFHIR": {
+                  "Type": "Task",
+                  "Resource": "${FhirToolFunction.Arn}",
+                  "InputPath": "$",
+                  "ResultPath": "$.verify",
+                  "Next": "SearchGuideline"
+                },
+                "SearchGuideline": {
+                  "Type": "Task",
+                  "Resource": "${SearchGuidelineToolFunction.Arn}",
+                  "InputPath": "$",
+                  "ResultPath": "$.guideline",
+                  "Next": "ProposeAction"
+                },
+                "ProposeAction": {
+                  "Type": "Task",
+                  "Resource": "${ProposeActionFunction.Arn}",
+                  "InputPath": "$",
+                  "ResultPath": "$.proposal",
+                  "Next": "ApprovalChoice"
+                },
+                "ApprovalChoice": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.proposal.analysis_result.risk_assessment",
+                          "StringEquals": "high"
+                        },
+                        {
+                          "Variable": "$.planOut.plan.requiresApproval",
+                          "BooleanEquals": true
+                        }
+                      ],
+                      "Next": "DiscordApproval"
+                    }
+                  ],
+                  "Default": "ExecuteAction"
+                },
+                "DiscordApproval": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                  "TimeoutSeconds": 259200,
+                  "Parameters": {
+                    "FunctionName": "${DiscordApprovalFunction.Arn}",
+                    "Payload": {
+                      "taskToken.$": "$$.Task.Token",
+                      "patient.$": "$.patient",
+                      "proposal.$": "$.proposal",
+                      "planOut.$": "$.planOut",
+                      "runId.$": "$.planOut.runId"
+                    }
+                  },
+                  "ResultPath": "$.approval",
+                  "Next": "ExecuteAction",
+                  "Catch": [
+                    {
+                      "ErrorEquals": ["States.ALL"],
+                      "ResultPath": "$.approvalError",
+                      "Next": "SummarizeRun"
+                    }
+                  ]
+                },
+                "ExecuteAction": {
+                  "Type": "Task",
+                  "Resource": "${ExecuteActionFunction.Arn}",
+                  "ResultPath": "$.executed",
+                  "Next": "SendAppointmentEmail"
+                },
+                "SendAppointmentEmail": {
+                  "Type": "Task",
+                  "Resource": "${AppointmentMailerFunction.Arn}",
+                  "ResultPath": "$.email",
+                  "Next": "WriteMemory"
+                },
+                "WriteMemory": {
+                  "Type": "Task",
+                  "Resource": "${WriteMemoryFunction.Arn}",
+                  "ResultPath": "$.memory",
+                  "Next": "SummarizeRun"
+                },
+                "SummarizeRun": {
+                  "Type": "Task",
+                  "Resource": "${SummarizeRunFunction.Arn}",
+                  "ResultPath": "$.summary",
+                  "End": true
+                }
+              }
+            }
+
+
+  # -----------------------------
+  # S3 → EventBridge → Lambda
+  # -----------------------------
+  S3ObjectCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 's3-object-created-${Environment}-${NameSuffix}'
+      Description: 'Route S3 Object Created events to the data processor Lambda'
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref PatientDataBucket
+      Targets:
+        - Arn: !GetAtt DataProcessorFunction.Arn
+          Id: DataProcessorTarget
+
+  EventBridgeInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DataProcessorFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt S3ObjectCreatedRule.Arn
+
+  DataGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'healthcare-data-generator-${Environment}-${NameSuffix}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          BUCKET: !Ref PatientDataBucket
+      Code:
+        ZipFile: |
+          import json, boto3, uuid, os
+          s3 = boto3.client('s3')
+          def lambda_handler(event, context):
+              bucket_name = event.get('bucket_name') or os.environ.get('BUCKET')
+              if not bucket_name:
+                  return {'statusCode': 400, 'body': 'Bucket name not provided'}
+              patient_data = {
+                  "patient_id": str(uuid.uuid4()),
+                  "patient_name": "Jane Doe",
+                  "patient_email": "jane.doe@example.com",
+                  "report_payload": "test_name,result_value\nHbA1c,8.2\n"
+              }
+              file_key = f"raw_data/{patient_data['patient_id']}.json"
+              s3.put_object(Bucket=bucket_name, Key=file_key, Body=json.dumps(patient_data), ContentType='application/json')
+              return {'statusCode': 200, 'body': json.dumps({'message': 'ok', 'patient_id': patient_data['patient_id'], 's3_key': file_key})}
+
+  DataProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'healthcare-data-processor-${Environment}-${NameSuffix}'
+      Description: 'Kicks off CareGap state machine on new S3 objects; also nudges Bedrock Agent. (BLUE)'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref CareGapStateMachine
+          AGENT_ID: !Ref HealthcareAgent
+          AGENT_ALIAS_ID: !Select [ 1, !Split [ '|', !Ref HealthcareAgentAlias ] ]
+      Code:
+        ZipFile: |
+          import json, boto3, os, time, datetime
+          s3 = boto3.client('s3')
+          sf = boto3.client('stepfunctions')
+          agentrt = boto3.client('bedrock-agent-runtime')
+          def lambda_handler(event, context):
+              detail = event.get('detail') or {}
+              bucket = (detail.get('bucket') or {}).get('name')
+              obj = (detail.get('object') or {}).get('key')
+              if not bucket or not obj:
+                  recs = event.get('Records') or []
+                  if recs:
+                      bucket = recs[0]['s3']['bucket']['name']
+                      obj = recs[0]['s3']['object']['key']
+              if not bucket or not obj:
+                  return {'statusCode': 400, 'body': 'No S3 object in event'}
+              s3obj = s3.get_object(Bucket=bucket, Key=obj)
+              patient_data = json.loads(s3obj['Body'].read().decode('utf-8'))
+
+              # Idempotent execution name
+              pid = patient_data.get('patient_id','na')
+              epoch = int(time.time())
+              exec_name = f"caregap-{pid}-{epoch}"
+
+              sf.start_execution(
+                  stateMachineArn=os.environ['STATE_MACHINE_ARN'],
+                  name=exec_name,
+                  input=json.dumps({"patient": patient_data})
+              )
+
+              try:
+                  resp = agentrt.invoke_agent(
+                      agentId=os.environ['AGENT_ID'],
+                      agentAliasId=os.environ['AGENT_ALIAS_ID'],
+                      sessionId=patient_data.get('patient_id','session-1'),
+                      inputText=json.dumps({"task":"Assess risk and generate messages","patient":patient_data})
+                  )
+                  for _ in resp.get('completion', []): pass
+              except Exception as e:
+                  print("Agent invocation failed:", str(e))
+
+              return {'statusCode': 200, 'body': 'Started state machine', 'executionName': exec_name}
+
+  # -----------------------------
+  # Patient-facing API (BLUE)
+  # -----------------------------
+  PatientGatewayFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'healthcare-patient-gateway-${Environment}-${NameSuffix}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          AGENT_ID: !Ref HealthcareAgent
+          AGENT_ALIAS_ID: !Select [ 1, !Split [ '|', !Ref HealthcareAgentAlias ] ]
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          agentrt = boto3.client('bedrock-agent-runtime')
+          def lambda_handler(event, context):
+              try:
+                  body = event.get('body')
+                  if isinstance(body, str):
+                      body = json.loads(body)
+                  body = body or {}
+                  patient = body.get('patient_data') or {}
+                  question = body.get('question') or "Help me understand my recent results."
+                  prompt = ("You are helping a patient understand their recent lab results in simple, supportive language. "
+                            "If risks are detected, advise contacting the care team. "
+                            "Question: " + question)
+                  resp = agentrt.invoke_agent(
+                      agentId=os.environ['AGENT_ID'],
+                      agentAliasId=os.environ['AGENT_ALIAS_ID'],
+                      sessionId=patient.get('patient_id', 'session-patient'),
+                      inputText=json.dumps({"task":"patient_explanation","patient":patient,"instruction":prompt})
+                  )
+                  parts = []
+                  for ev in resp.get('completion', []):
+                      if 'chunk' in ev and 'bytes' in ev['chunk']:
+                          parts.append(ev['chunk']['bytes'].decode('utf-8'))
+                  answer = "".join(parts) if parts else "Thanks, we received your question."
+                  return {
+                      "statusCode": 200,
+                      "headers": {
+                        "Content-Type": "application/json",
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Headers": "Content-Type",
+                        "Access-Control-Allow-Methods": "POST,GET,OPTIONS"
+                      },
+                      "body": json.dumps({"answer": answer})
+                  }
+              except Exception as e:
+                  return {
+                      "statusCode": 500,
+                      "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"},
+                      "body": json.dumps({"error": str(e)})
+                  }
+
+  ApprovalCallbackPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApprovalCallbackFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PatientHttpApi}/*/GET/approve'
+
+  PatientGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PatientGatewayFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PatientHttpApi}/*/POST/ask'
+
+  PatientHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub 'healthcare-patient-api-${Environment}-${NameSuffix}'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: ['POST','GET','OPTIONS']
+        AllowHeaders: ['Content-Type']
+
+  PatientHttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PatientHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PatientGatewayFunction.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  PatientHttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PatientHttpApi
+      RouteKey: 'POST /ask'
+      Target: !Sub 'integrations/${PatientHttpApiIntegration}'
+
+  ApprovalCallbackIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PatientHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApprovalCallbackFunction.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  ApprovalCallbackRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PatientHttpApi
+      RouteKey: 'GET /approve'
+      Target: !Sub 'integrations/${ApprovalCallbackIntegration}'
+
+  PatientHttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref PatientHttpApi
+      StageName: !Ref Environment
+      AutoDeploy: true
+
+Outputs:
+  PatientDataBucketName:
+    Description: 'S3 bucket for patient data (BLUE)'
+    Value: !Ref PatientDataBucket
+  NotificationQueueURL:
+    Description: 'SQS queue for care coordination tasks (BLUE)'
+    Value: !Ref NotificationQueue
+  AgentId:
+    Description: 'Bedrock Agent ID (BLUE)'
+    Value: !Ref HealthcareAgent
+  AgentAliasId:
+    Description: 'Bedrock Agent Alias ID (BLUE)'
+    Value: !Select [ 1, !Split [ '|', !Ref HealthcareAgentAlias ] ]
+  PatientApiUrl:
+    Description: 'Invoke URL for patient API (POST /ask) (BLUE)'
+    Value: !Sub 'https://${PatientHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/ask'
+  ApprovalUrlBase:
+    Description: 'Base URL for approval callback path (GET /approve)'
+    Value: !Sub 'https://${PatientHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/approve'
+  StateMachineArn:
+    Description: 'CareGap Step Functions state machine ARN (BLUE)'
+    Value: !Ref CareGapStateMachine
+  MemoryTable:
+    Description: 'DynamoDB for agent memory (BLUE)'
+    Value: !Ref AgentMemoryTable
+  RunsTable:
+    Description: 'DynamoDB for run logs (BLUE)'
+    Value: !Ref AgentRunsTable
+  DiscordSecretArn:
+    Description: 'Discord webhook secret ARN'
+    Value: !Ref DiscordWebhookSecret
+  SesFromIdentity:
+    Description: 'SES verified identity used for outbound mail'
+    Value: !Ref SesIdentity
